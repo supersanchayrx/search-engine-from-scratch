@@ -1,0 +1,18 @@
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Python (benchmark baselines)
+.venv/
+__pycache__/
+
+# Downloaded datasets and built indexes
+data/
+indexes/
+bench/results/raw/
+
+# Local env and build notes
+.env
+context-docs/

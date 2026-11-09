@@ -1,6 +1,6 @@
 # search-engine-from-scratch
 
-A full-text and vector search engine written from scratch in TypeScript on Node.js, with no search libraries. It has an inverted index stored as immutable segments, compressed postings, BM25 ranking with Block-Max WAND top-k retrieval, HNSW vector search and hybrid ranking. It will be benchmarked against Postgres full-text search (GIN), pgvector and Lucene on public datasets.
+A full-text and vector search engine written from scratch in Go, using only the standard library and no search libraries. It has an inverted index stored as immutable segments, compressed postings, BM25 ranking with Block-Max WAND top-k retrieval, HNSW vector search and hybrid ranking. It will be benchmarked against Postgres full-text search (GIN), pgvector and Lucene on public datasets.
 
 > **Status:** work in progress. The design and roadmap are below. Results will be added here as each part lands.
 
@@ -21,19 +21,19 @@ This project builds each of those pieces by hand and measures them against the s
 
 | Component | What it does |
 |---|---|
-| **Analyzer** | Unicode NFKC normalisation, lowercasing, tokenisation, stop words and a Porter stemmer written by hand |
+| **Analyzer** | Unicode-aware tokenisation and case folding (Go's `unicode` package), stop words and a Porter stemmer written by hand |
 | **Indexing buffer** | New documents go into an in-memory buffer, which is flushed to a new segment when it reaches a size limit |
-| **Segment format** | Per segment: a term dictionary (sorted, front-coded blocks with a sparse in-memory index), postings (doc-ID gaps bit-packed in blocks of 128, term frequencies and positions), document lengths, stored fields, and a CRC32 checksum per file |
+| **Segment format** | Per segment: a term dictionary (sorted, front-coded blocks with a sparse in-memory index), postings (doc-ID gaps bit-packed in blocks of 128, term frequencies and positions), document lengths, stored fields, and a CRC32-C checksum per file |
 | **Skip data** | For each postings block: the last doc ID, its file offset and the block's maximum BM25 score |
 | **Commits** | A commit file lists the live segments. It is written to a temp file, fsynced and renamed, so a crash always leaves the last complete commit readable |
-| **Deletes and merges** | Deletes are per-segment tombstone bitsets. A tiered merge policy merges segments of similar size and drops deleted documents |
+| **Deletes and merges** | Deletes are per-segment tombstone bitsets. A tiered merge policy merges segments of similar size in a background goroutine and drops deleted documents |
 | **Query parser** | Terms, AND / OR / NOT, quoted phrases and field filters |
-| **Query execution** | Document-at-a-time iterators with `next` and `advance`; exhaustive OR, WAND and Block-Max WAND for top-k; phrase matching on positions |
+| **Query execution** | Document-at-a-time iterators with `Next` and `Advance`; exhaustive OR, WAND and Block-Max WAND for top-k; phrase matching on positions |
 | **Scoring** | BM25 with configurable `k1` and `b`, using collection statistics summed across segments |
-| **Vectors** | One HNSW graph per segment over `Float32Array`s (parameters `M`, `efConstruction`, `efSearch`), cosine and L2 distance, optional int8 scalar quantisation |
+| **Vectors** | One HNSW graph per segment over `[]float32` (parameters `M`, `efConstruction`, `efSearch`), cosine and L2 distance, optional int8 scalar quantisation |
 | **Hybrid** | Reciprocal Rank Fusion of the BM25 and vector result lists, with the same filters applied to both |
-| **Concurrency** | Segments are searched in parallel on `worker_threads`; each search sees a point-in-time snapshot while indexing and merges continue |
-| **Server** | A JSON HTTP API on `node:http`: index, delete, search and stats |
+| **Concurrency** | Each search fans out one goroutine per segment and merges the per-segment top-k heaps. Readers take a reference-counted snapshot of the segment list (swapped with `atomic.Pointer`), so indexing and merges never block queries and a merged-away segment is closed only when its last reader finishes |
+| **Server** | A JSON HTTP API on `net/http`: index, delete, search and stats, with `pprof` endpoints for profiling |
 
 ## Benchmarks (planned)
 
@@ -41,7 +41,7 @@ Every number will come with the script that produced it, the hardware and the ex
 
 - **Ranking quality:** nDCG@10 on BEIR datasets (SciFact, NFCorpus, FiQA-2018, TREC-COVID), compared with Lucene's BM25 run through Pyserini. The goal is to match Lucene, which shows the analyzer and BM25 are right.
 - **Query speed:** MS MARCO passage ranking (8,841,823 passages, 6,980 dev queries). It reports p50 and p99 top-10 latency for exhaustive scoring, WAND and Block-Max WAND, and compares them with Postgres GIN + `ts_rank_cd` on the same passages.
-- **Index build:** documents per second, index size in bytes per posting, and merge cost.
+- **Index build:** documents per second, index size in bytes per posting, merge cost, and allocations per document from `go test -bench -benchmem`.
 - **Vector search:** `sift-128-euclidean` (1M vectors) and `glove-100-angular` (1.18M vectors) from ann-benchmarks. It reports recall@10 against QPS across a sweep of `efSearch`, build time and memory, compared with pgvector's HNSW (`m = 16`, `ef_construction = 64`, its defaults) at matched recall.
 - **Hybrid:** nDCG@10 for BM25 alone, vectors alone (embeddings from an open sentence-embedding model such as `BAAI/bge-small-en-v1.5`) and RRF fusion, on SciFact and FiQA-2018.
 - **Crash safety:** `kill -9` during indexing and merges, repeated many times, then a check that the index opens at its last commit with every checksum valid.
@@ -49,9 +49,10 @@ Every number will come with the script that produced it, the hardware and the ex
 ## Testing
 
 - Every top-k strategy (exhaustive, WAND, Block-Max WAND) must return the same top-k documents and scores as a brute-force scorer, on random documents and random queries.
-- Codecs round-trip: bit-packing, front coding and the term dictionary are checked on random input, including edge cases such as empty blocks, single postings and the maximum doc ID.
+- Codecs round-trip: bit-packing, front coding and the term dictionary are checked with Go's built-in fuzzing (`go test -fuzz`), including edge cases such as empty blocks, single postings and the maximum doc ID.
 - HNSW recall@10 is checked against an exact search at fixed parameters.
 - Merges keep search results unchanged: the same queries return the same results before and after a forced merge.
+- Concurrent indexing, merging and searching run under the race detector (`go test -race`).
 
 ## Roadmap
 
@@ -64,25 +65,27 @@ Every number will come with the script that produced it, the hardware and the ex
 - [ ] Phrase queries and the query parser
 - [ ] HNSW, then int8 scalar quantisation
 - [ ] Hybrid search with RRF
-- [ ] Parallel segment search on worker threads, and the HTTP API
+- [ ] Concurrent segment search with reference-counted snapshots, and the HTTP API
 - [ ] Benchmarks against Postgres GIN, pgvector and Lucene
 - [ ] Write-up
 
 ## Planned structure
 
 ```
-src/
-  analysis/   # tokeniser, stop words, Porter stemmer
-  codec/      # bit-packing, varints, front-coded term dictionary, CRC32
-  index/      # indexing buffer, segment writer and reader, commits, merge policy
-  search/     # postings iterators, BM25, WAND, Block-Max WAND, phrases, query parser
-  vector/     # HNSW, scalar quantisation
-  hybrid/     # Reciprocal Rank Fusion
-  server/     # HTTP API
-bench/        # MS MARCO, BEIR and ann-benchmarks runners, plus Postgres/pgvector and Pyserini baselines
-test/
+cmd/
+  searchd/      # HTTP server
+  bench/        # benchmark runners (MS MARCO, BEIR, ann-benchmarks)
+internal/
+  analysis/     # tokeniser, stop words, Porter stemmer
+  codec/        # bit-packing, varints, front-coded term dictionary, checksums
+  index/        # indexing buffer, segment writer and reader, commits, merge policy
+  search/       # postings iterators, BM25, WAND, Block-Max WAND, phrases, query parser
+  vector/       # HNSW, scalar quantisation
+  hybrid/       # Reciprocal Rank Fusion
+  server/       # HTTP handlers
+bench/          # dataset scripts and the Postgres/pgvector and Pyserini baselines
 ```
 
 ## Requirements
 
-Node.js 24 or newer and TypeScript. The engine uses only Node.js built-ins at runtime. The benchmarks also need Docker (for Postgres with pgvector) and Python (for Pyserini and for computing embeddings).
+Go 1.26 or newer. The engine uses only the Go standard library. The benchmarks also need Docker (for Postgres with pgvector) and Python (for Pyserini and for computing embeddings).

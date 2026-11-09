@@ -1,8 +1,12 @@
-# Node / TypeScript
-node_modules/
-dist/
-*.tsbuildinfo
-npm-debug.log*
+# Go
+/bin/
+*.exe
+*.test
+*.out
+*.prof
+coverage.*
+go.work
+go.work.sum
 
 # Python (benchmark baselines)
 .venv/
